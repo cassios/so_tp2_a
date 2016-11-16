@@ -29,15 +29,20 @@ typedef struct {
     pid_t pid;
     PageInfo *page;
     int accessed;
+    int dirty;
 } FrameTable;
+
+typedef struct {
+    PageInfo *page;
+    int used;
+} BlockTable;
 
 int _nframes, _nblocks, _page_size;
 FrameTable frame_table[1000];
 PageTable processes_list[100];
-int _block_cnt = 0;
+BlockTable blocks[10000];
 int _nprocesses = 0;
 int _second_chance_index = 0;
-int _used_blocks = 0;
 
 /****************************************************************************
  * external functions
@@ -45,6 +50,13 @@ int _used_blocks = 0;
 int get_new_frame() {
     for(int i = 0; i < _nframes; i++) {
         if(frame_table[i].pid == -1) return i;
+    }
+    return -1;
+}
+
+int get_new_block() {
+    for(int i = 0; i < _nblocks; i++) {
+        if(blocks[i].page == NULL) return i;
     }
     return -1;
 }
@@ -71,9 +83,13 @@ void pager_init(int nframes, int nblocks)
     _nframes = nframes;
     _nblocks = nblocks;
     _page_size = sysconf(_SC_PAGESIZE);
-    
+
     for(int i = 0; i < _nframes; i++) {
         frame_table[i].pid = -1;
+    }
+
+    for(int i = 0; i < _nblocks; i++) {
+        blocks[i].used = 0;
     }
     //frame_table = malloc(_nframes * sizeof(FrameTable));
 }
@@ -85,7 +101,7 @@ void pager_create(pid_t pid)
     pt->pid = pid;
     pt->npages = 0;
     pt->pages = (PageInfo*) malloc(_nframes * sizeof(PageInfo));
-    
+
     for(int i = 0; i < _nframes; i++) {
         pt->pages[i].isvalid = 0;
     }
@@ -93,7 +109,10 @@ void pager_create(pid_t pid)
 
 void *pager_extend(pid_t pid)
 {
-    if(_block_cnt++ == _nblocks) {
+    int block_no = get_new_block();
+
+    //there is no block available anymore
+    if(block_no == -1) {
         return NULL;
     }
 
@@ -103,7 +122,9 @@ void *pager_extend(pid_t pid)
     PageInfo *page = &pt->pages[npages];
     page->isvalid = 0;
     page->vaddr = UVM_BASEADDR + npages * _page_size;
-    page->block_number = -1;
+    page->block_number = block_no;
+
+    blocks[block_no].page = page;
 
     return (void*)page->vaddr;
 }
@@ -118,6 +139,15 @@ int second_chance() {
         }
         _second_chance_index = (_second_chance_index + 1) % _nframes;
     }
+
+    if(frame_to_swap == 0) {
+        for(int i = 0; i < _nframes; i++) {
+            PageInfo *page = frame_table[i].page;
+            page->prot = PROT_NONE;
+            mmu_chprot(frame_table[i].pid, (void*)page->vaddr, page->prot);
+        }
+    }
+
     return frame_to_swap;
 }
 
@@ -129,7 +159,9 @@ void pager_fault(pid_t pid, void *vaddr)
     if(page->isvalid == 1) {
         page->prot = PROT_READ | PROT_WRITE;
         mmu_chprot(pid, vaddr, page->prot);
-    } else {
+        frame_table[page->frame_number].accessed = 1;
+        frame_table[page->frame_number].dirty = 1;
+    } else if(page->isvalid == 0) {
         int frame = get_new_frame();
 
         //there is no frame available
@@ -137,19 +169,30 @@ void pager_fault(pid_t pid, void *vaddr)
             frame = second_chance();
             PageInfo *removed_page = frame_table[frame].page;
             removed_page->isvalid = 0;
-            removed_page->block_number = _used_blocks++;
-            mmu_disk_write(frame, removed_page->block_number);
             mmu_nonresident(frame_table[frame].pid, (void*)removed_page->vaddr); 
+            if(frame_table[frame].dirty == 1) {
+                blocks[removed_page->block_number].used = 1;
+                mmu_disk_write(frame, removed_page->block_number);
+            }
         }
         frame_table[frame].pid = pid;
         frame_table[frame].page = page;
         frame_table[frame].accessed = 1;
+        frame_table[frame].dirty = 0;
+
+        page->isvalid = 1;
         page->frame_number = frame;
         page->prot = PROT_READ;
-        page->isvalid = 1;
 
-        mmu_zero_fill(frame);
+
+        if(blocks[page->block_number].used == 1) {
+            mmu_disk_read(page->block_number, frame);
+        } else {
+            mmu_zero_fill(frame);
+        }
         mmu_resident(pid, vaddr, page->frame_number, page->prot);
+    } else {
+        printf("missing case");
     }
 }
 

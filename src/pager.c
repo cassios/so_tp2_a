@@ -11,6 +11,39 @@
 
 #include "mmu.h"
 
+/////////////////////////////////list////////////////////////////////////////
+struct dlist {
+	struct dnode *head;
+	struct dnode *tail;
+	int count;
+};
+struct dnode {
+	struct dnode *prev;
+	struct dnode *next;
+	void *data;
+};
+typedef void (*dlist_data_func)(void *data);
+typedef int (*dlist_cmp_func)(const void *e1, const void *e2, void *userdata); 
+struct dlist *dlist_create(void);
+void dlist_destroy(struct dlist *dl, dlist_data_func);
+void *dlist_pop_left(struct dlist *dl);
+void *dlist_pop_right(struct dlist *dl);
+void *dlist_push_right(struct dlist *dl, void *data);
+
+/* this function calls =cmp to compare =data and each value in =dl.  if a
+ * match is found, it is removed from the list and its pointer is returned.
+ * returns NULL if no match is found. */
+void *dlist_find_remove(struct dlist *dl, void *data, dlist_cmp_func cmp,
+			void *userdata);
+
+int dlist_empty(struct dlist *dl);
+
+/* gets the data at index =idx.  =idx can be negative. */
+void * dlist_get_index(const struct dlist *dl, int idx);
+/* changes the data at index =idx.  does nothing if =idx does not exist. */
+void dlist_set_index(struct dlist *dl, int idx, void *data);
+////////////////////////////list end///////////////////////////////////////////////
+
 typedef struct {
     int isvalid;
     int frame_number;
@@ -38,10 +71,9 @@ typedef struct {
 } BlockTable;
 
 int _nframes, _nblocks, _page_size;
-FrameTable frame_table[1000];
-PageTable processes_list[100];
-BlockTable blocks[10000];
-int _nprocesses = 0;
+FrameTable *frame_table;
+BlockTable *blocks;
+struct dlist *page_tables;
 int _second_chance_index = 0;
 
 /****************************************************************************
@@ -62,8 +94,9 @@ int get_new_block() {
 }
 
 PageTable* find_page_table(pid_t pid) {
-    for(int i = 0; i < _nprocesses; i++) {
-        if(processes_list[i].pid == pid) return &processes_list[i];
+    for(int i = 0; i < page_tables->count; i++) {
+        PageTable *pt = dlist_get_index(page_tables, i);
+        if(pt->pid == pid) return pt;
     }
     printf("error: Pid not found\n");
     exit(-1);
@@ -84,20 +117,21 @@ void pager_init(int nframes, int nblocks)
     _nblocks = nblocks;
     _page_size = sysconf(_SC_PAGESIZE);
 
+    frame_table = malloc(_nframes * sizeof(FrameTable));
     for(int i = 0; i < _nframes; i++) {
         frame_table[i].pid = -1;
     }
 
+    blocks = malloc(_nblocks * sizeof(BlockTable));
     for(int i = 0; i < _nblocks; i++) {
         blocks[i].used = 0;
     }
-    //frame_table = malloc(_nframes * sizeof(FrameTable));
+    page_tables = dlist_create();
 }
 
 void pager_create(pid_t pid)
 {
-    //PageTable *pt = (PageTable*) malloc(sizeof(PageTable));
-    PageTable *pt = &processes_list[_nprocesses++];
+    PageTable *pt = (PageTable*) malloc(sizeof(PageTable));
     pt->pid = pid;
     pt->npages = 0;
     pt->pages = (PageInfo*) malloc(_nframes * sizeof(PageInfo));
@@ -105,6 +139,7 @@ void pager_create(pid_t pid)
     for(int i = 0; i < _nframes; i++) {
         pt->pages[i].isvalid = 0;
     }
+    dlist_push_right(page_tables, pt);
 }
 
 void *pager_extend(pid_t pid)
@@ -220,3 +255,144 @@ void pager_destroy(pid_t pid)
 {
     //TODO: must destroy all allocated resourses to that page
 }
+///////////////////////////////////////////////////
+
+
+struct dlist *dlist_create(void) /* {{{ */
+{
+	struct dlist *dl = malloc(sizeof(struct dlist));
+	assert(dl);
+	dl->head = NULL;
+	dl->tail = NULL;
+	dl->count = 0;
+	return dl;
+} /* }}} */
+
+void dlist_destroy(struct dlist *dl, dlist_data_func cb) /* {{{ */
+{
+	while(!dlist_empty(dl)) {
+		void *data = dlist_pop_left(dl);
+		if(cb) cb(data);
+	}
+	free(dl);
+} /* }}} */
+
+void *dlist_pop_left(struct dlist *dl) /* {{{ */
+{
+	void *data;
+	struct dnode *node;
+
+	if(dlist_empty(dl)) return NULL;
+
+	node = dl->head;
+
+	dl->head = node->next;
+	if(dl->head == NULL) dl->tail = NULL;
+	if(node->next) node->next->prev = NULL;
+
+	data = node->data;
+	free(node);
+
+	dl->count--;
+	assert(dl->count >= 0);
+	return data;
+} /* }}} */
+
+void *dlist_pop_right(struct dlist *dl) /* {{{ */
+{
+	void *data;
+	struct dnode *node;
+
+	if(dlist_empty(dl)) return NULL;
+
+	node = dl->tail;
+
+	dl->tail = node->prev;
+	if(dl->tail == NULL) dl->head = NULL;
+	if(node->prev) node->prev->next = NULL;
+
+	data = node->data;
+	free(node);
+
+	dl->count--;
+	assert(dl->count >= 0);
+	return data;
+} /* }}} */
+
+void *dlist_push_right(struct dlist *dl, void *data) /* {{{ */
+{
+	struct dnode *node = malloc(sizeof(struct dnode));
+	assert(node);
+
+	node->data = data;
+	node->prev = dl->tail;
+	node->next = NULL;
+
+	if(dl->tail) dl->tail->next = node;
+	dl->tail = node;
+
+	if(dl->head == NULL) dl->head = node;
+
+	dl->count++;
+	return data;
+} /* }}} */
+
+void *dlist_find_remove(struct dlist *dl, void *data, /* {{{ */
+		dlist_cmp_func cmp, void *user_data)
+{
+	struct dnode *curr;
+	for(curr = dl->head; curr; curr = curr->next) {
+		if(!curr->data) continue;
+		if(cmp(curr->data, data, user_data)) continue;
+		void *ptr = curr->data;
+		if(dl->head == curr) dl->head = curr->next;
+		if(dl->tail == curr) dl->tail = curr->prev;
+		if(curr->prev) curr->prev->next = curr->next;
+		if(curr->next) curr->next->prev = curr->prev;
+		dl->count--;
+		free(curr);
+		return ptr;
+	}
+	return NULL;
+} /* }}} */
+
+int dlist_empty(struct dlist *dl) /* {{{ */
+{
+	if(dl->head == NULL) {
+		assert(dl->tail == NULL);
+		assert(dl->count == 0);
+		return 1;
+	} else {
+		assert(dl->tail != NULL);
+		assert(dl->count > 0);
+		return 0;
+	}
+} /* }}} */
+
+void * dlist_get_index(const struct dlist *dl, int idx) /* {{{ */
+{
+	struct dnode *curr;
+	if(idx >= 0) {
+		curr = dl->head;
+		while(curr && idx--) curr = curr->next;
+	} else {
+		curr = dl->tail;
+		while(curr && ++idx) curr = curr->prev;
+	}
+	if(!curr) return NULL;
+	return curr->data;
+} /* }}} */
+
+void dlist_set_index(struct dlist *dl, int idx, void *data) /* {{{ */
+{
+	struct dnode *curr;
+	if(idx >= 0) {
+		curr = dl->head;
+		while(curr && idx--) curr = curr->next;
+	} else {
+		curr = dl->tail;
+		while(curr && ++idx) curr = curr->prev;
+	}
+	if(!curr) return;
+	curr->data = data;
+} /* }}} */

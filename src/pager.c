@@ -54,8 +54,7 @@ typedef struct {
 
 typedef struct {
     pid_t pid;
-    int npages;
-    PageInfo *pages;
+    struct dlist *pages;
 } PageTable;
 
 typedef struct {
@@ -103,9 +102,9 @@ PageTable* find_page_table(pid_t pid) {
 }
 
 PageInfo* get_page(PageTable *pt, intptr_t vaddr) {
-    PageInfo *pages = pt->pages;
-    for(int i=0; i < pt->npages; i++) {
-        if(vaddr == pages[i].vaddr) return &pages[i];
+    for(int i=0; i < pt->pages->count; i++) {
+        PageInfo *page = dlist_get_index(pt->pages, i);
+        if(page->vaddr == vaddr) return page;
     }
     printf("error in get_page_index: page was not found");
     exit(-1);
@@ -133,12 +132,7 @@ void pager_create(pid_t pid)
 {
     PageTable *pt = (PageTable*) malloc(sizeof(PageTable));
     pt->pid = pid;
-    pt->npages = 0;
-    pt->pages = (PageInfo*) malloc(_nframes * sizeof(PageInfo));
-
-    for(int i = 0; i < _nframes; i++) {
-        pt->pages[i].isvalid = 0;
-    }
+    pt->pages = dlist_create();
     dlist_push_right(page_tables, pt);
 }
 
@@ -152,12 +146,11 @@ void *pager_extend(pid_t pid)
     }
 
     PageTable *pt = find_page_table(pid); 
-    int npages = pt->npages++;
-
-    PageInfo *page = &pt->pages[npages];
+    PageInfo *page = (PageInfo*) malloc(sizeof(PageInfo));
     page->isvalid = 0;
-    page->vaddr = UVM_BASEADDR + npages * _page_size;
+    page->vaddr = UVM_BASEADDR + pt->pages->count * _page_size;
     page->block_number = block_no;
+    dlist_push_right(pt->pages, page);
 
     blocks[block_no].page = page;
 

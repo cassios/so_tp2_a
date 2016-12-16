@@ -50,7 +50,7 @@ typedef struct {
     int block_number;
     int prot;
     intptr_t vaddr;
-} PageInfo;
+} Page;
 
 typedef struct {
     pid_t pid;
@@ -59,19 +59,19 @@ typedef struct {
 
 typedef struct {
     pid_t pid;
-    PageInfo *page;
+    Page *page;
     int accessed;
     int dirty;
 } FrameTable;
 
 typedef struct {
-    PageInfo *page;
+    Page *page;
     int used;
 } BlockTable;
 
 int _nframes, _nblocks, _page_size;
 FrameTable *frame_table;
-BlockTable *blocks;
+BlockTable *block_table;
 struct dlist *page_tables;
 int _second_chance_index = 0;
 
@@ -87,7 +87,7 @@ int get_new_frame() {
 
 int get_new_block() {
     for(int i = 0; i < _nblocks; i++) {
-        if(blocks[i].page == NULL) return i;
+        if(block_table[i].page == NULL) return i;
     }
     return -1;
 }
@@ -101,9 +101,9 @@ PageTable* find_page_table(pid_t pid) {
     exit(-1);
 }
 
-PageInfo* get_page(PageTable *pt, intptr_t vaddr) {
+Page* get_page(PageTable *pt, intptr_t vaddr) {
     for(int i=0; i < pt->pages->count; i++) {
-        PageInfo *page = dlist_get_index(pt->pages, i);
+        Page *page = dlist_get_index(pt->pages, i);
         if(page->vaddr == vaddr) return page;
     }
     printf("error in get_page_index: page was not found");
@@ -121,9 +121,9 @@ void pager_init(int nframes, int nblocks)
         frame_table[i].pid = -1;
     }
 
-    blocks = malloc(_nblocks * sizeof(BlockTable));
+    block_table = malloc(_nblocks * sizeof(BlockTable));
     for(int i = 0; i < _nblocks; i++) {
-        blocks[i].used = 0;
+        block_table[i].used = 0;
     }
     page_tables = dlist_create();
 }
@@ -146,13 +146,13 @@ void *pager_extend(pid_t pid)
     }
 
     PageTable *pt = find_page_table(pid); 
-    PageInfo *page = (PageInfo*) malloc(sizeof(PageInfo));
+    Page *page = (Page*) malloc(sizeof(Page));
     page->isvalid = 0;
     page->vaddr = UVM_BASEADDR + pt->pages->count * _page_size;
     page->block_number = block_no;
     dlist_push_right(pt->pages, page);
 
-    blocks[block_no].page = page;
+    block_table[block_no].page = page;
 
     return (void*)page->vaddr;
 }
@@ -170,7 +170,7 @@ int second_chance() {
 
     if(frame_to_swap == 0) {
         for(int i = 0; i < _nframes; i++) {
-            PageInfo *page = frame_table[i].page;
+            Page *page = frame_table[i].page;
             page->prot = PROT_NONE;
             mmu_chprot(frame_table[i].pid, (void*)page->vaddr, page->prot);
         }
@@ -182,24 +182,24 @@ int second_chance() {
 void pager_fault(pid_t pid, void *vaddr)
 {
     PageTable *pt = find_page_table(pid); 
-    PageInfo *page = get_page(pt, (intptr_t)vaddr); 
+    Page *page = get_page(pt, (intptr_t)vaddr); 
 
     if(page->isvalid == 1) {
         page->prot = PROT_READ | PROT_WRITE;
         mmu_chprot(pid, vaddr, page->prot);
         frame_table[page->frame_number].accessed = 1;
         frame_table[page->frame_number].dirty = 1;
-    } else if(page->isvalid == 0) {
+    } else {
         int frame = get_new_frame();
 
         //there is no frame available
         if(frame == -1) {
             frame = second_chance();
-            PageInfo *removed_page = frame_table[frame].page;
+            Page *removed_page = frame_table[frame].page;
             removed_page->isvalid = 0;
             mmu_nonresident(frame_table[frame].pid, (void*)removed_page->vaddr); 
             if(frame_table[frame].dirty == 1) {
-                blocks[removed_page->block_number].used = 1;
+                block_table[removed_page->block_number].used = 1;
                 mmu_disk_write(frame, removed_page->block_number);
             }
         }
@@ -213,14 +213,12 @@ void pager_fault(pid_t pid, void *vaddr)
         page->prot = PROT_READ;
 
 
-        if(blocks[page->block_number].used == 1) {
+        if(block_table[page->block_number].used == 1) {
             mmu_disk_read(page->block_number, frame);
         } else {
             mmu_zero_fill(frame);
         }
         mmu_resident(pid, vaddr, page->frame_number, page->prot);
-    } else {
-        printf("missing case");
     }
 }
 
@@ -231,7 +229,7 @@ int pager_syslog(pid_t pid, void *addr, size_t len)
     char *buf = (char*) malloc(len + 1);
 
     for (int i = 0, m = 0; i < len; i++) {
-        PageInfo *page = get_page(pt, (intptr_t)addr); 
+        Page *page = get_page(pt, (intptr_t)addr); 
         int frame = page->frame_number;
 
         //TODO: must check page boundaries and return 1 in case it is out of the page

@@ -1,5 +1,5 @@
 LOGFLAGS=-DUVMLOG -DMMULOG
-CFLAGS=-g -Wall -Isrc
+CFLAGS=-g -Wall -Isrc -std=gnu99
 
 all:
 	gcc -c $(CFLAGS) src/log.c

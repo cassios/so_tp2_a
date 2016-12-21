@@ -13,14 +13,14 @@
 
 /////////////////////////////////list////////////////////////////////////////
 struct dlist {
-	struct dnode *head;
-	struct dnode *tail;
-	int count;
+    struct dnode *head;
+    struct dnode *tail;
+    int count;
 };
 struct dnode {
-	struct dnode *prev;
-	struct dnode *next;
-	void *data;
+    struct dnode *prev;
+    struct dnode *next;
+    void *data;
 };
 typedef void (*dlist_data_func)(void *data);
 typedef int (*dlist_cmp_func)(const void *e1, const void *e2, void *userdata); 
@@ -34,7 +34,7 @@ void *dlist_push_right(struct dlist *dl, void *data);
  * match is found, it is removed from the list and its pointer is returned.
  * returns NULL if no match is found. */
 void *dlist_find_remove(struct dlist *dl, void *data, dlist_cmp_func cmp,
-			void *userdata);
+        void *userdata);
 
 int dlist_empty(struct dlist *dl);
 
@@ -59,14 +59,14 @@ typedef struct {
 
 typedef struct {
     pid_t pid;
+    int accessed; //to be used by second change algorithm
+    int dirty; //when the frame is dirty, it must to be wrote on the disk before replace pages
     Page *page;
-    int accessed;
-    int dirty;
 } FrameTable;
 
 typedef struct {
+    int used; //1 if the page was copied to the disk, 0 otherwise
     Page *page;
-    int used;
 } BlockTable;
 
 int _nframes, _nblocks, _page_size;
@@ -97,7 +97,7 @@ PageTable* find_page_table(pid_t pid) {
         PageTable *pt = dlist_get_index(page_tables, i);
         if(pt->pid == pid) return pt;
     }
-    printf("error: Pid not found\n");
+    printf("error in find_page_table: Pid not found\n");
     exit(-1);
 }
 
@@ -106,8 +106,7 @@ Page* get_page(PageTable *pt, intptr_t vaddr) {
         Page *page = dlist_get_index(pt->pages, i);
         if(page->vaddr == vaddr) return page;
     }
-    printf("error in get_page_index: page was not found");
-    exit(-1);
+    return NULL;
 }
 
 void pager_init(int nframes, int nblocks)
@@ -140,7 +139,7 @@ void *pager_extend(pid_t pid)
 {
     int block_no = get_new_block();
 
-    //there is no block available anymore
+    //there is no blocks available anymore
     if(block_no == -1) {
         return NULL;
     }
@@ -168,20 +167,13 @@ int second_chance() {
         _second_chance_index = (_second_chance_index + 1) % _nframes;
     }
 
-    if(frame_to_swap == 0) {
-        for(int i = 0; i < _nframes; i++) {
-            Page *page = frame_table[i].page;
-            page->prot = PROT_NONE;
-            mmu_chprot(frame_table[i].pid, (void*)page->vaddr, page->prot);
-        }
-    }
-
     return frame_to_swap;
 }
 
 void pager_fault(pid_t pid, void *vaddr)
 {
     PageTable *pt = find_page_table(pid); 
+    vaddr = (void*)((intptr_t)vaddr - (intptr_t)vaddr%_page_size);
     Page *page = get_page(pt, (intptr_t)vaddr); 
 
     if(page->isvalid == 1) {
@@ -195,6 +187,17 @@ void pager_fault(pid_t pid, void *vaddr)
         //there is no frame available
         if(frame == -1) {
             frame = second_chance();
+    
+            //gambis: I do not know why I have to set PROT_NONE to all pages
+            //when I am swapping the first one. Must investigate
+            if(frame == 0) {
+                for(int i = 0; i < _nframes; i++) {
+                    Page *page = frame_table[i].page;
+                    page->prot = PROT_NONE;
+                    mmu_chprot(frame_table[i].pid, (void*)page->vaddr, page->prot);
+                }
+            }
+
             Page *removed_page = frame_table[frame].page;
             removed_page->isvalid = 0;
             mmu_nonresident(frame_table[frame].pid, (void*)removed_page->vaddr); 
@@ -212,7 +215,7 @@ void pager_fault(pid_t pid, void *vaddr)
         page->frame_number = frame;
         page->prot = PROT_READ;
 
-
+        //this page was already swapped out from main memory
         if(block_table[page->block_number].used == 1) {
             mmu_disk_read(page->block_number, frame);
         } else {
@@ -228,11 +231,15 @@ int pager_syslog(pid_t pid, void *addr, size_t len)
     PageTable *pt = find_page_table(pid); 
     char *buf = (char*) malloc(len + 1);
 
-    for (int i = 0, m = 0; i < len; i++) {
-        Page *page = get_page(pt, (intptr_t)addr); 
+    for (size_t i = 0, m = 0; i < len; i++) {
+        intptr_t aux_addr = (intptr_t)addr - ((intptr_t)addr)%_page_size;
+        printf("\naddr: %p  ... addr+i: %p", addr, (void *)((intptr_t)addr + i));
+        Page *page = get_page(pt, aux_addr);
+        
+        //string out of process allocated space
+        if(page == NULL) {printf("\n \n deu merda \n");return -1;}
+        
         int frame = page->frame_number;
-
-        //TODO: must check page boundaries and return 1 in case it is out of the page
         buf[m++] = pmem[frame * _page_size + i];
     }
     for(int i = 0; i < len; i++) { // len é o número de bytes a imprimir
@@ -245,145 +252,157 @@ int pager_syslog(pid_t pid, void *addr, size_t len)
 void pager_destroy(pid_t pid)
 {
     //TODO: must destroy all allocated resourses to that page
+    PageTable *pt = find_page_table(pid); 
+    
+    while(!dlist_empty(pt->pages)) {
+        Page *page = dlist_pop_right(pt->pages);
+        block_table[page->block_number].page = NULL;
+        if(page->isvalid == 1) {
+            frame_table[page->frame_number].pid = -1;
+        }
+    }
+    dlist_destroy(pt->pages, NULL);
+    //TODO: remove pt from page_tables
+    //and free pt
 }
 ///////////////////////////////////////////////////
 
 
 struct dlist *dlist_create(void) /* {{{ */
 {
-	struct dlist *dl = malloc(sizeof(struct dlist));
-	assert(dl);
-	dl->head = NULL;
-	dl->tail = NULL;
-	dl->count = 0;
-	return dl;
+    struct dlist *dl = malloc(sizeof(struct dlist));
+    assert(dl);
+    dl->head = NULL;
+    dl->tail = NULL;
+    dl->count = 0;
+    return dl;
 } /* }}} */
 
 void dlist_destroy(struct dlist *dl, dlist_data_func cb) /* {{{ */
 {
-	while(!dlist_empty(dl)) {
-		void *data = dlist_pop_left(dl);
-		if(cb) cb(data);
-	}
-	free(dl);
+    while(!dlist_empty(dl)) {
+        void *data = dlist_pop_left(dl);
+        if(cb) cb(data);
+    }
+    free(dl);
 } /* }}} */
 
 void *dlist_pop_left(struct dlist *dl) /* {{{ */
 {
-	void *data;
-	struct dnode *node;
+    void *data;
+    struct dnode *node;
 
-	if(dlist_empty(dl)) return NULL;
+    if(dlist_empty(dl)) return NULL;
 
-	node = dl->head;
+    node = dl->head;
 
-	dl->head = node->next;
-	if(dl->head == NULL) dl->tail = NULL;
-	if(node->next) node->next->prev = NULL;
+    dl->head = node->next;
+    if(dl->head == NULL) dl->tail = NULL;
+    if(node->next) node->next->prev = NULL;
 
-	data = node->data;
-	free(node);
+    data = node->data;
+    free(node);
 
-	dl->count--;
-	assert(dl->count >= 0);
-	return data;
+    dl->count--;
+    assert(dl->count >= 0);
+    return data;
 } /* }}} */
 
 void *dlist_pop_right(struct dlist *dl) /* {{{ */
 {
-	void *data;
-	struct dnode *node;
+    void *data;
+    struct dnode *node;
 
-	if(dlist_empty(dl)) return NULL;
+    if(dlist_empty(dl)) return NULL;
 
-	node = dl->tail;
+    node = dl->tail;
 
-	dl->tail = node->prev;
-	if(dl->tail == NULL) dl->head = NULL;
-	if(node->prev) node->prev->next = NULL;
+    dl->tail = node->prev;
+    if(dl->tail == NULL) dl->head = NULL;
+    if(node->prev) node->prev->next = NULL;
 
-	data = node->data;
-	free(node);
+    data = node->data;
+    free(node);
 
-	dl->count--;
-	assert(dl->count >= 0);
-	return data;
+    dl->count--;
+    assert(dl->count >= 0);
+    return data;
 } /* }}} */
 
 void *dlist_push_right(struct dlist *dl, void *data) /* {{{ */
 {
-	struct dnode *node = malloc(sizeof(struct dnode));
-	assert(node);
+    struct dnode *node = malloc(sizeof(struct dnode));
+    assert(node);
 
-	node->data = data;
-	node->prev = dl->tail;
-	node->next = NULL;
+    node->data = data;
+    node->prev = dl->tail;
+    node->next = NULL;
 
-	if(dl->tail) dl->tail->next = node;
-	dl->tail = node;
+    if(dl->tail) dl->tail->next = node;
+    dl->tail = node;
 
-	if(dl->head == NULL) dl->head = node;
+    if(dl->head == NULL) dl->head = node;
 
-	dl->count++;
-	return data;
+    dl->count++;
+    return data;
 } /* }}} */
 
 void *dlist_find_remove(struct dlist *dl, void *data, /* {{{ */
-		dlist_cmp_func cmp, void *user_data)
+        dlist_cmp_func cmp, void *user_data)
 {
-	struct dnode *curr;
-	for(curr = dl->head; curr; curr = curr->next) {
-		if(!curr->data) continue;
-		if(cmp(curr->data, data, user_data)) continue;
-		void *ptr = curr->data;
-		if(dl->head == curr) dl->head = curr->next;
-		if(dl->tail == curr) dl->tail = curr->prev;
-		if(curr->prev) curr->prev->next = curr->next;
-		if(curr->next) curr->next->prev = curr->prev;
-		dl->count--;
-		free(curr);
-		return ptr;
-	}
-	return NULL;
+    struct dnode *curr;
+    for(curr = dl->head; curr; curr = curr->next) {
+        if(!curr->data) continue;
+        if(cmp(curr->data, data, user_data)) continue;
+        void *ptr = curr->data;
+        if(dl->head == curr) dl->head = curr->next;
+        if(dl->tail == curr) dl->tail = curr->prev;
+        if(curr->prev) curr->prev->next = curr->next;
+        if(curr->next) curr->next->prev = curr->prev;
+        dl->count--;
+        free(curr);
+        return ptr;
+    }
+    return NULL;
 } /* }}} */
 
 int dlist_empty(struct dlist *dl) /* {{{ */
 {
-	if(dl->head == NULL) {
-		assert(dl->tail == NULL);
-		assert(dl->count == 0);
-		return 1;
-	} else {
-		assert(dl->tail != NULL);
-		assert(dl->count > 0);
-		return 0;
-	}
+    if(dl->head == NULL) {
+        assert(dl->tail == NULL);
+        assert(dl->count == 0);
+        return 1;
+    } else {
+        assert(dl->tail != NULL);
+        assert(dl->count > 0);
+        return 0;
+    }
 } /* }}} */
 
 void * dlist_get_index(const struct dlist *dl, int idx) /* {{{ */
 {
-	struct dnode *curr;
-	if(idx >= 0) {
-		curr = dl->head;
-		while(curr && idx--) curr = curr->next;
-	} else {
-		curr = dl->tail;
-		while(curr && ++idx) curr = curr->prev;
-	}
-	if(!curr) return NULL;
-	return curr->data;
+    struct dnode *curr;
+    if(idx >= 0) {
+        curr = dl->head;
+        while(curr && idx--) curr = curr->next;
+    } else {
+        curr = dl->tail;
+        while(curr && ++idx) curr = curr->prev;
+    }
+    if(!curr) return NULL;
+    return curr->data;
 } /* }}} */
 
 void dlist_set_index(struct dlist *dl, int idx, void *data) /* {{{ */
 {
-	struct dnode *curr;
-	if(idx >= 0) {
-		curr = dl->head;
-		while(curr && idx--) curr = curr->next;
-	} else {
-		curr = dl->tail;
-		while(curr && ++idx) curr = curr->prev;
-	}
-	if(!curr) return;
-	curr->data = data;
+    struct dnode *curr;
+    if(idx >= 0) {
+        curr = dl->head;
+        while(curr && idx--) curr = curr->next;
+    } else {
+        curr = dl->tail;
+        while(curr && ++idx) curr = curr->prev;
+    }
+    if(!curr) return;
+    curr->data = data;
 } /* }}} */

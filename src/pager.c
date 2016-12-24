@@ -37,7 +37,6 @@ typedef struct {
     int isvalid;
     int frame_number;
     int block_number;
-    int prot;
     intptr_t vaddr;
 } Page;
 
@@ -71,9 +70,10 @@ int get_new_frame();
 int get_new_block();
 PageTable* find_page_table(pid_t pid);
 Page* get_page(PageTable *pt, intptr_t vaddr); 
+pthread_mutex_t locker;
 
 void pager_init(int nframes, int nblocks) {
-    //printf("\n\npage init\n\n");
+    pthread_mutex_lock(&locker);
     _nframes = nframes;
     _nblocks = nblocks;
     _page_size = sysconf(_SC_PAGESIZE);
@@ -83,29 +83,31 @@ void pager_init(int nframes, int nblocks) {
         frame_table[i].pid = -1;
     }
 
-    //printf("\nframe allocated\n");
     block_table = malloc(_nblocks * sizeof(BlockTable));
     for(int i = 0; i < _nblocks; i++) {
         block_table[i].used = 0;
     }
-    //printf("\nblock allocated\n");
     page_tables = dlist_create();
-    //printf("\nlist created\n");
+    pthread_mutex_unlock(&locker);
 }
 
 void pager_create(pid_t pid) {
-    //printf("\npager_create\n");
+    pthread_mutex_lock(&locker);
     PageTable *pt = (PageTable*) malloc(sizeof(PageTable));
     pt->pid = pid;
     pt->pages = dlist_create();
+
     dlist_push_right(page_tables, pt);
+    pthread_mutex_unlock(&locker);
 }
 
 void *pager_extend(pid_t pid) {
+    pthread_mutex_lock(&locker);
     int block_no = get_new_block();
 
     //there is no blocks available anymore
     if(block_no == -1) {
+        pthread_mutex_unlock(&locker);
         return NULL;
     }
 
@@ -118,6 +120,7 @@ void *pager_extend(pid_t pid) {
 
     block_table[block_no].page = page;
 
+    pthread_mutex_unlock(&locker);
     return (void*)page->vaddr;
 }
 
@@ -136,13 +139,13 @@ int second_chance() {
 }
 
 void pager_fault(pid_t pid, void *vaddr) {
+    pthread_mutex_lock(&locker);
     PageTable *pt = find_page_table(pid); 
     vaddr = (void*)((intptr_t)vaddr - (intptr_t)vaddr%_page_size);
     Page *page = get_page(pt, (intptr_t)vaddr); 
 
     if(page->isvalid == 1) {
-        page->prot = PROT_READ | PROT_WRITE;
-        mmu_chprot(pid, vaddr, page->prot);
+        mmu_chprot(pid, vaddr, PROT_READ | PROT_WRITE);
         frame_table[page->frame_number].accessed = 1;
         frame_table[page->frame_number].dirty = 1;
     } else {
@@ -157,8 +160,7 @@ void pager_fault(pid_t pid, void *vaddr) {
             if(frame == 0) {
                 for(int i = 0; i < _nframes; i++) {
                     Page *page = frame_table[i].page;
-                    page->prot = PROT_NONE;
-                    mmu_chprot(frame_table[i].pid, (void*)page->vaddr, page->prot);
+                    mmu_chprot(frame_table[i].pid, (void*)page->vaddr, PROT_NONE);
                 }
             }
 
@@ -177,7 +179,6 @@ void pager_fault(pid_t pid, void *vaddr) {
 
         page->isvalid = 1;
         page->frame_number = frame;
-        page->prot = PROT_READ;
 
         //this page was already swapped out from main memory
         if(block_table[page->block_number].used == 1) {
@@ -185,11 +186,13 @@ void pager_fault(pid_t pid, void *vaddr) {
         } else {
             mmu_zero_fill(frame);
         }
-        mmu_resident(pid, vaddr, page->frame_number, page->prot);
+        mmu_resident(pid, vaddr, page->frame_number, PROT_READ);
     }
+    pthread_mutex_unlock(&locker);
 }
 
 int pager_syslog(pid_t pid, void *addr, size_t len) {
+    pthread_mutex_lock(&locker);
     PageTable *pt = find_page_table(pid); 
     char *buf = (char*) malloc(len + 1);
 
@@ -197,7 +200,10 @@ int pager_syslog(pid_t pid, void *addr, size_t len) {
         Page *page = get_page(pt, (intptr_t)addr + i);
         
         //string out of process allocated space
-        if(page == NULL) return -1;
+        if(page == NULL) {
+            pthread_mutex_unlock(&locker);
+            return -1;
+        }
         
         buf[m++] = pmem[page->frame_number * _page_size + i];
     }
@@ -205,10 +211,12 @@ int pager_syslog(pid_t pid, void *addr, size_t len) {
         printf("%02x", (unsigned)buf[i]); // buf contém os dados a serem impressos
     }
     if(len > 0) printf("\n");
+    pthread_mutex_unlock(&locker);
     return 0;
 }
 
 void pager_destroy(pid_t pid) {
+    pthread_mutex_lock(&locker);
     PageTable *pt = find_page_table(pid); 
     
     while(!dlist_empty(pt->pages)) {
@@ -219,6 +227,7 @@ void pager_destroy(pid_t pid) {
         }
     }
     dlist_destroy(pt->pages, NULL);
+    pthread_mutex_unlock(&locker);
     //TODO: remove pt from page_tables
     //and free pt
 }
@@ -274,10 +283,10 @@ void dlist_destroy(struct dlist *dl, dlist_data_func cb) {
 }
 
 void *dlist_pop_right(struct dlist *dl) {
+    if(dlist_empty(dl)) return NULL;
+
     void *data;
     struct dnode *node;
-
-    if(dlist_empty(dl)) return NULL;
 
     node = dl->tail;
 
@@ -290,6 +299,7 @@ void *dlist_pop_right(struct dlist *dl) {
 
     dl->count--;
     assert(dl->count >= 0);
+    
     return data;
 }
 
@@ -307,19 +317,22 @@ void *dlist_push_right(struct dlist *dl, void *data) {
     if(dl->head == NULL) dl->head = node;
 
     dl->count++;
+
     return data;
 }
 
 int dlist_empty(struct dlist *dl) {
+    int ret;
     if(dl->head == NULL) {
         assert(dl->tail == NULL);
         assert(dl->count == 0);
-        return 1;
+        ret = 1;
     } else {
         assert(dl->tail != NULL);
         assert(dl->count > 0);
-        return 0;
+        ret = 0;
     }
+    return ret;
 }
 
 void * dlist_get_index(const struct dlist *dl, int idx) {

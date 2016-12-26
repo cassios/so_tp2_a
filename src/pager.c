@@ -50,18 +50,28 @@ typedef struct {
     int accessed; //to be used by second change algorithm
     int dirty; //when the frame is dirty, it must to be wrote on the disk before replace pages
     Page *page;
+} FrameNode;
+
+typedef struct {
+    int nframes;
+    int nblocks;
+    int page_size;
+    int sec_chance_index;
+    FrameNode *frames;
 } FrameTable;
 
 typedef struct {
     int used; //1 if the page was copied to the disk, 0 otherwise
     Page *page;
+} BlockNode;
+
+typedef struct {
+    BlockNode *blocks;
 } BlockTable;
 
-int _nframes, _nblocks, _page_size;
-FrameTable *frame_table;
-BlockTable *block_table;
+FrameTable frame_table;
+BlockTable block_table;
 struct dlist *page_tables;
-int _second_chance_index = 0;
 
 /****************************************************************************
  * external functions
@@ -74,18 +84,19 @@ pthread_mutex_t locker;
 
 void pager_init(int nframes, int nblocks) {
     pthread_mutex_lock(&locker);
-    _nframes = nframes;
-    _nblocks = nblocks;
-    _page_size = sysconf(_SC_PAGESIZE);
+    frame_table.nframes = nframes;
+    frame_table.nblocks = nblocks;
+    frame_table.page_size = sysconf(_SC_PAGESIZE);
+    frame_table.sec_chance_index = 0;
 
-    frame_table = malloc(_nframes * sizeof(FrameTable));
-    for(int i = 0; i < _nframes; i++) {
-        frame_table[i].pid = -1;
+    frame_table.frames = malloc(nframes * sizeof(FrameNode));
+    for(int i = 0; i < nframes; i++) {
+        frame_table.frames[i].pid = -1;
     }
 
-    block_table = malloc(_nblocks * sizeof(BlockTable));
-    for(int i = 0; i < _nblocks; i++) {
-        block_table[i].used = 0;
+    block_table.blocks = malloc(nblocks * sizeof(BlockNode));
+    for(int i = 0; i < nblocks; i++) {
+        block_table.blocks[i].used = 0;
     }
     page_tables = dlist_create();
     pthread_mutex_unlock(&locker);
@@ -114,79 +125,89 @@ void *pager_extend(pid_t pid) {
     PageTable *pt = find_page_table(pid); 
     Page *page = (Page*) malloc(sizeof(Page));
     page->isvalid = 0;
-    page->vaddr = UVM_BASEADDR + pt->pages->count * _page_size;
+    page->vaddr = UVM_BASEADDR + pt->pages->count * frame_table.page_size;
     page->block_number = block_no;
     dlist_push_right(pt->pages, page);
 
-    block_table[block_no].page = page;
+    block_table.blocks[block_no].page = page;
 
     pthread_mutex_unlock(&locker);
     return (void*)page->vaddr;
 }
 
 int second_chance() {
+    FrameNode *frames = frame_table.frames;
     int frame_to_swap = -1;
+
     while(frame_to_swap == -1) {
-        if(frame_table[_second_chance_index].accessed == 0) {
-            frame_to_swap = _second_chance_index;
+        int index = frame_table.sec_chance_index;
+        if(frames[index].accessed == 0) {
+            frame_to_swap = index;
         } else {
-            frame_table[_second_chance_index].accessed = 0;
+            frames[index].accessed = 0;
         }
-        _second_chance_index = (_second_chance_index + 1) % _nframes;
+        frame_table.sec_chance_index = (index + 1) % frame_table.nframes;
     }
 
     return frame_to_swap;
 }
 
+void swap_out_page(int frame_no) {
+    //gambis: I do not know why I have to set PROT_NONE to all pages
+    //when I am swapping the first one. Must investigate
+    if(frame_no == 0) {
+        for(int i = 0; i < frame_table.nframes; i++) {
+            Page *page = frame_table.frames[i].page;
+            mmu_chprot(frame_table.frames[i].pid, (void*)page->vaddr, PROT_NONE);
+        }
+    }
+
+    FrameNode *frame = &frame_table.frames[frame_no];
+    Page *removed_page = frame->page;
+    removed_page->isvalid = 0;
+    mmu_nonresident(frame->pid, (void*)removed_page->vaddr); 
+    
+    if(frame->dirty == 1) {
+        block_table.blocks[removed_page->block_number].used = 1;
+        mmu_disk_write(frame_no, removed_page->block_number);
+    }
+}
+
 void pager_fault(pid_t pid, void *vaddr) {
     pthread_mutex_lock(&locker);
     PageTable *pt = find_page_table(pid); 
-    vaddr = (void*)((intptr_t)vaddr - (intptr_t)vaddr%_page_size);
+    vaddr = (void*)((intptr_t)vaddr - (intptr_t)vaddr % frame_table.page_size);
     Page *page = get_page(pt, (intptr_t)vaddr); 
 
     if(page->isvalid == 1) {
         mmu_chprot(pid, vaddr, PROT_READ | PROT_WRITE);
-        frame_table[page->frame_number].accessed = 1;
-        frame_table[page->frame_number].dirty = 1;
+        frame_table.frames[page->frame_number].accessed = 1;
+        frame_table.frames[page->frame_number].dirty = 1;
     } else {
-        int frame = get_new_frame();
+        int frame_no = get_new_frame();
 
-        //there is no frame available
-        if(frame == -1) {
-            frame = second_chance();
-    
-            //gambis: I do not know why I have to set PROT_NONE to all pages
-            //when I am swapping the first one. Must investigate
-            if(frame == 0) {
-                for(int i = 0; i < _nframes; i++) {
-                    Page *page = frame_table[i].page;
-                    mmu_chprot(frame_table[i].pid, (void*)page->vaddr, PROT_NONE);
-                }
-            }
-
-            Page *removed_page = frame_table[frame].page;
-            removed_page->isvalid = 0;
-            mmu_nonresident(frame_table[frame].pid, (void*)removed_page->vaddr); 
-            if(frame_table[frame].dirty == 1) {
-                block_table[removed_page->block_number].used = 1;
-                mmu_disk_write(frame, removed_page->block_number);
-            }
+        //there is no frames available
+        if(frame_no == -1) {
+            frame_no = second_chance();
+            swap_out_page(frame_no);
         }
-        frame_table[frame].pid = pid;
-        frame_table[frame].page = page;
-        frame_table[frame].accessed = 1;
-        frame_table[frame].dirty = 0;
+
+        FrameNode *frame = &frame_table.frames[frame_no];
+        frame->pid = pid;
+        frame->page = page;
+        frame->accessed = 1;
+        frame->dirty = 0;
 
         page->isvalid = 1;
-        page->frame_number = frame;
+        page->frame_number = frame_no;
 
         //this page was already swapped out from main memory
-        if(block_table[page->block_number].used == 1) {
-            mmu_disk_read(page->block_number, frame);
+        if(block_table.blocks[page->block_number].used == 1) {
+            mmu_disk_read(page->block_number, frame_no);
         } else {
-            mmu_zero_fill(frame);
+            mmu_zero_fill(frame_no);
         }
-        mmu_resident(pid, vaddr, page->frame_number, PROT_READ);
+        mmu_resident(pid, vaddr, frame_no, PROT_READ);
     }
     pthread_mutex_unlock(&locker);
 }
@@ -198,14 +219,14 @@ int pager_syslog(pid_t pid, void *addr, size_t len) {
 
     for (size_t i = 0, m = 0; i < len; i++) {
         Page *page = get_page(pt, (intptr_t)addr + i);
-        
+
         //string out of process allocated space
         if(page == NULL) {
             pthread_mutex_unlock(&locker);
             return -1;
         }
-        
-        buf[m++] = pmem[page->frame_number * _page_size + i];
+
+        buf[m++] = pmem[page->frame_number * frame_table.page_size + i];
     }
     for(int i = 0; i < len; i++) { // len é o número de bytes a imprimir
         printf("%02x", (unsigned)buf[i]); // buf contém os dados a serem impressos
@@ -218,12 +239,12 @@ int pager_syslog(pid_t pid, void *addr, size_t len) {
 void pager_destroy(pid_t pid) {
     pthread_mutex_lock(&locker);
     PageTable *pt = find_page_table(pid); 
-    
+
     while(!dlist_empty(pt->pages)) {
         Page *page = dlist_pop_right(pt->pages);
-        block_table[page->block_number].page = NULL;
+        block_table.blocks[page->block_number].page = NULL;
         if(page->isvalid == 1) {
-            frame_table[page->frame_number].pid = -1;
+            frame_table.frames[page->frame_number].pid = -1;
         }
     }
     dlist_destroy(pt->pages, NULL);
@@ -234,15 +255,15 @@ void pager_destroy(pid_t pid) {
 
 /////////////////Auxiliar functions ////////////////////////////////
 int get_new_frame() {
-    for(int i = 0; i < _nframes; i++) {
-        if(frame_table[i].pid == -1) return i;
+    for(int i = 0; i < frame_table.nframes; i++) {
+        if(frame_table.frames[i].pid == -1) return i;
     }
     return -1;
 }
 
 int get_new_block() {
-    for(int i = 0; i < _nblocks; i++) {
-        if(block_table[i].page == NULL) return i;
+    for(int i = 0; i < frame_table.nblocks; i++) {
+        if(block_table.blocks[i].page == NULL) return i;
     }
     return -1;
 }
@@ -259,7 +280,7 @@ PageTable* find_page_table(pid_t pid) {
 Page* get_page(PageTable *pt, intptr_t vaddr) {
     for(int i=0; i < pt->pages->count; i++) {
         Page *page = dlist_get_index(pt->pages, i);
-        if(vaddr >= page->vaddr && vaddr < (page->vaddr + _page_size)) return page;
+        if(vaddr >= page->vaddr && vaddr < (page->vaddr + frame_table.page_size)) return page;
     }
     return NULL;
 }
@@ -299,7 +320,7 @@ void *dlist_pop_right(struct dlist *dl) {
 
     dl->count--;
     assert(dl->count >= 0);
-    
+
     return data;
 }
 

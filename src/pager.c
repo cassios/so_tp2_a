@@ -37,6 +37,7 @@ typedef struct {
     int isvalid;
     int frame_number;
     int block_number;
+    int dirty; //when the page is dirty, it must to be wrote on the disk before swaping it
     intptr_t vaddr;
 } Page;
 
@@ -48,13 +49,11 @@ typedef struct {
 typedef struct {
     pid_t pid;
     int accessed; //to be used by second change algorithm
-    int dirty; //when the frame is dirty, it must to be wrote on the disk before replace pages
     Page *page;
 } FrameNode;
 
 typedef struct {
     int nframes;
-    int nblocks;
     int page_size;
     int sec_chance_index;
     FrameNode *frames;
@@ -66,6 +65,7 @@ typedef struct {
 } BlockNode;
 
 typedef struct {
+    int nblocks;
     BlockNode *blocks;
 } BlockTable;
 
@@ -85,7 +85,6 @@ pthread_mutex_t locker;
 void pager_init(int nframes, int nblocks) {
     pthread_mutex_lock(&locker);
     frame_table.nframes = nframes;
-    frame_table.nblocks = nblocks;
     frame_table.page_size = sysconf(_SC_PAGESIZE);
     frame_table.sec_chance_index = 0;
 
@@ -94,6 +93,7 @@ void pager_init(int nframes, int nblocks) {
         frame_table.frames[i].pid = -1;
     }
 
+    block_table.nblocks = nblocks;
     block_table.blocks = malloc(nblocks * sizeof(BlockNode));
     for(int i = 0; i < nblocks; i++) {
         block_table.blocks[i].used = 0;
@@ -167,7 +167,7 @@ void swap_out_page(int frame_no) {
     removed_page->isvalid = 0;
     mmu_nonresident(frame->pid, (void*)removed_page->vaddr); 
     
-    if(frame->dirty == 1) {
+    if(removed_page->dirty == 1) {
         block_table.blocks[removed_page->block_number].used = 1;
         mmu_disk_write(frame_no, removed_page->block_number);
     }
@@ -182,7 +182,7 @@ void pager_fault(pid_t pid, void *vaddr) {
     if(page->isvalid == 1) {
         mmu_chprot(pid, vaddr, PROT_READ | PROT_WRITE);
         frame_table.frames[page->frame_number].accessed = 1;
-        frame_table.frames[page->frame_number].dirty = 1;
+        page->dirty = 1;
     } else {
         int frame_no = get_new_frame();
 
@@ -196,10 +196,10 @@ void pager_fault(pid_t pid, void *vaddr) {
         frame->pid = pid;
         frame->page = page;
         frame->accessed = 1;
-        frame->dirty = 0;
 
         page->isvalid = 1;
         page->frame_number = frame_no;
+        page->dirty = 0;
 
         //this page was already swapped out from main memory
         if(block_table.blocks[page->block_number].used == 1) {
@@ -249,8 +249,6 @@ void pager_destroy(pid_t pid) {
     }
     dlist_destroy(pt->pages, NULL);
     pthread_mutex_unlock(&locker);
-    //TODO: remove pt from page_tables
-    //and free pt
 }
 
 /////////////////Auxiliar functions ////////////////////////////////
@@ -262,7 +260,7 @@ int get_new_frame() {
 }
 
 int get_new_block() {
-    for(int i = 0; i < frame_table.nblocks; i++) {
+    for(int i = 0; i < block_table.nblocks; i++) {
         if(block_table.blocks[i].page == NULL) return i;
     }
     return -1;

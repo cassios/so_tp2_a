@@ -15,7 +15,7 @@ do grupo no desenvolvimento do trabalho (os valores devem somar
 100%).
 
   * Cassios Marques <cassios.kmm@gmail.com> 50%
-  * Yuri <email@domain> 50%
+  * Yuri <ignitzhjfk@gmail.com> 50%
 
 3. Referências bibliográficas
     Foi reutilizado a estrutura de dados de lista encadeada
